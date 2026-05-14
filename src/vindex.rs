@@ -1,7 +1,7 @@
 //! Vindex file loader — mmap binary weight files, zero-copy access.
 
 use std::fs::File;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use memmap2::Mmap;
 use rayon::prelude::*;
 
@@ -43,13 +43,26 @@ pub struct Vindex {
 
 impl Vindex {
     pub fn load(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::load_with_attn_weights(path, None)
+    }
+
+    /// Load vindex from `path` (index.json, embeddings, gate, optional up/down/norms).
+    /// Attention weights default to `path/attn_weights.bin`; override with `attn_weights_bin`
+    /// (e.g. FFN tree + separate attention blob).
+    pub fn load_with_attn_weights(
+        path: &Path,
+        attn_weights_bin: Option<&Path>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let config: VindexConfig = serde_json::from_str(&std::fs::read_to_string(path.join("index.json"))?)?;
         let h = config.hidden_size;
         let gate_mmap = Self::mmap_file(&path.join("gate_vectors.bin"))?;
         let embed_mmap = Self::mmap_file(&path.join("embeddings.bin"))?;
         let up_mmap = Self::try_mmap(&path.join("up_weights.bin"));
         let down_mmap = Self::try_mmap(&path.join("down_weights.bin"));
-        let attn_mmap = Self::try_mmap(&path.join("attn_weights.bin"));
+        let attn_mmap = match attn_weights_bin {
+            Some(p) => Self::try_mmap(p),
+            None => Self::try_mmap(&path.join("attn_weights.bin")),
+        };
         let norms_mmap = Self::try_mmap(&path.join("norms.bin"));
         log::info!("Vindex loaded: {} layers, h={}, gate={:.1}GB, attn={}",
             config.num_layers, h, gate_mmap.len() as f64/1e9,

@@ -1,3 +1,44 @@
-/target
-*.vindex
-Cargo.lock
+# Rust
+/target/
+**/*.rs.bk
+
+# Python
+.venv/
+venv/
+ENV/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+
+# Large local model / weight trees (do not push)
+hf_checkout/
+*.vindex/
+
+# Hugging Face download cache inside a vindex checkout
+**/.cache/
+
+# Common weight dumps at repo root (if any)
+*.safetensors
+
+# Secrets / local env
+.env
+.env.*
+!.env.example
+
+# OS / editor
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.swp
+*.swo
+.idea/
+
+# Logs / temp
+*.log
+/tmp/

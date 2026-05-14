@@ -10,15 +10,30 @@ pub struct InferenceResult {
     pub logits_ms: f64,
 }
 
+/// Full transformer (default) or ablation: skip the attention sub-layer each block, FFN only.
 pub fn infer(vindex: &Vindex, token_ids: &[u32], top_k: usize) -> InferenceResult {
+    infer_impl(vindex, token_ids, top_k, false)
+}
+
+pub fn infer_ffn_only(vindex: &Vindex, token_ids: &[u32], top_k: usize) -> InferenceResult {
+    infer_impl(vindex, token_ids, top_k, true)
+}
+
+fn infer_impl(vindex: &Vindex, token_ids: &[u32], top_k: usize, skip_attention: bool) -> InferenceResult {
     let total = std::time::Instant::now();
     let h = vindex.config.hidden_size;
     let nl = vindex.config.num_layers;
     let (nq, nkv, hd) = vindex.attn_dims();
     let groups = nq / nkv;
-    let inter = vindex.config.intermediate_size;
     let attn_scale = 1.0 / (hd as f32).sqrt();
     let is_global = |l: usize| (l + 1) % 6 == 0;
+
+    if !skip_attention && vindex.attn_raw().is_none() {
+        log::warn!(
+            "attn_weights.bin missing (or --attn-weights path invalid); attention sublayers skipped, FFN still runs. \
+             For full transformer forward, supply attn_weights.bin or --attn-weights."
+        );
+    }
 
     let scale = vindex.config.embed_scale;
     let mut residuals: Vec<Vec<f32>> = token_ids.iter().map(|&tid| {
@@ -28,49 +43,53 @@ pub fn infer(vindex: &Vindex, token_ids: &[u32], top_k: usize) -> InferenceResul
 
     let layer_start = std::time::Instant::now();
     for layer in 0..nl {
-        let iln = vindex.norm_weights(layer, 0);
-        let paln = vindex.norm_weights(layer, 1);
         let pfln = vindex.norm_weights(layer, 2);
         let pfnl = vindex.norm_weights(layer, 3);
-        let attn = match vindex.attn_layer(layer) { Some(a) => a, None => continue };
-        let (rb, rf) = if is_global(layer) { (1e6f64, 8.0f64) } else { (1e4f64, 1.0f64) };
 
-        // Pre-attn norm + Q/K/V projections
-        let normed: Vec<Vec<f32>> = residuals.iter().map(|r| rms_norm_1(r, &iln)).collect();
-        let mut all_q = Vec::with_capacity(nt);
-        let mut all_k = Vec::with_capacity(nt);
-        let mut all_v = Vec::with_capacity(nt);
-        for tok in 0..nt {
-            let mut q = matvec_par(&attn.w_q, &normed[tok], nq*hd, h);
-            let mut k = matvec_par(&attn.w_k, &normed[tok], nkv*hd, h);
-            let v = matvec_par(&attn.w_v, &normed[tok], nkv*hd, h);
-            for hi in 0..nq { rms_norm_qk(&mut q[hi*hd..(hi+1)*hd], &attn.q_norm); }
-            for hi in 0..nkv { rms_norm_qk(&mut k[hi*hd..(hi+1)*hd], &attn.k_norm); }
-            let pos = tok as f64 / rf;
-            for hi in 0..nq { apply_rope_hf(&mut q[hi*hd..(hi+1)*hd], pos, rb, hd); }
-            for hi in 0..nkv { apply_rope_hf(&mut k[hi*hd..(hi+1)*hd], pos, rb, hd); }
-            all_q.push(q); all_k.push(k); all_v.push(v);
-        }
+        if !skip_attention {
+            if let Some(attn) = vindex.attn_layer(layer) {
+                let iln = vindex.norm_weights(layer, 0);
+                let paln = vindex.norm_weights(layer, 1);
+                let (rb, rf) = if is_global(layer) { (1e6f64, 8.0f64) } else { (1e4f64, 1.0f64) };
 
-        // Causal attention + O projection
-        for tok in 0..nt {
-            let mut ho = vec![0.0f32; nq*hd];
-            for hi in 0..nq {
-                let kv_hi = hi/groups; let qs = hi*hd; let ks = kv_hi*hd;
-                let mut scores: Vec<f32> = (0..=tok).map(|j|
-                    (0..hd).map(|d| all_q[tok][qs+d]*all_k[j][ks+d]).sum::<f32>() * attn_scale
-                ).collect();
-                let max_s = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let exp_s: Vec<f32> = scores.iter().map(|&s| (s-max_s).exp()).collect();
-                let sum_e: f32 = exp_s.iter().sum();
-                for j in 0..=tok {
-                    let w = exp_s[j] / sum_e.max(1e-10);
-                    for d in 0..hd { ho[qs+d] += w * all_v[j][ks+d]; }
+                // Pre-attn norm + Q/K/V projections
+                let normed: Vec<Vec<f32>> = residuals.iter().map(|r| rms_norm_1(r, &iln)).collect();
+                let mut all_q = Vec::with_capacity(nt);
+                let mut all_k = Vec::with_capacity(nt);
+                let mut all_v = Vec::with_capacity(nt);
+                for tok in 0..nt {
+                    let mut q = matvec_par(&attn.w_q, &normed[tok], nq*hd, h);
+                    let mut k = matvec_par(&attn.w_k, &normed[tok], nkv*hd, h);
+                    let v = matvec_par(&attn.w_v, &normed[tok], nkv*hd, h);
+                    for hi in 0..nq { rms_norm_qk(&mut q[hi*hd..(hi+1)*hd], &attn.q_norm); }
+                    for hi in 0..nkv { rms_norm_qk(&mut k[hi*hd..(hi+1)*hd], &attn.k_norm); }
+                    let pos = tok as f64 / rf;
+                    for hi in 0..nq { apply_rope_hf(&mut q[hi*hd..(hi+1)*hd], pos, rb, hd); }
+                    for hi in 0..nkv { apply_rope_hf(&mut k[hi*hd..(hi+1)*hd], pos, rb, hd); }
+                    all_q.push(q); all_k.push(k); all_v.push(v);
+                }
+
+                // Causal attention + O projection
+                for tok in 0..nt {
+                    let mut ho = vec![0.0f32; nq*hd];
+                    for hi in 0..nq {
+                        let kv_hi = hi/groups; let qs = hi*hd; let ks = kv_hi*hd;
+                        let scores: Vec<f32> = (0..=tok).map(|j|
+                            (0..hd).map(|d| all_q[tok][qs+d]*all_k[j][ks+d]).sum::<f32>() * attn_scale
+                        ).collect();
+                        let max_s = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                        let exp_s: Vec<f32> = scores.iter().map(|&s| (s-max_s).exp()).collect();
+                        let sum_e: f32 = exp_s.iter().sum();
+                        for j in 0..=tok {
+                            let w = exp_s[j] / sum_e.max(1e-10);
+                            for d in 0..hd { ho[qs+d] += w * all_v[j][ks+d]; }
+                        }
+                    }
+                    let attn_out = matvec_par(&attn.w_o, &ho, h, nq*hd);
+                    let na = rms_norm_1(&attn_out, &paln);
+                    for (r, a) in residuals[tok].iter_mut().zip(na.iter()) { *r += a; }
                 }
             }
-            let attn_out = matvec_par(&attn.w_o, &ho, h, nq*hd);
-            let na = rms_norm_1(&attn_out, &paln);
-            for (r, a) in residuals[tok].iter_mut().zip(na.iter()) { *r += a; }
         }
 
         // FFN (dense)
