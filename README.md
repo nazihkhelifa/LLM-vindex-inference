@@ -62,6 +62,21 @@ cargo build --release
 
 **`--conversation`** turns on **greedy autoregressive** decoding: each step runs a full forward on the growing sequence and appends the **top-1** token until an **EOS / end-of-turn** token (from the tokenizer) or **`--max-new-tokens`** (default **256**). Requires **`--prompt`** and **`tokenizer.json`** (or **`--tokenizer`**). Cannot be combined with **`--token-ids`**.
 
+### What actually runs the attention math (important)
+
+Default **`vindex-infer`** / **`inference.rs`** self-attention uses **only** the standard LarQL vindex binaries:
+
+| Role | File |
+|------|------|
+| Q, K, V, O projections + per-head Q/K RMS (in the packed blob) | **`attn_weights.bin`** (or the path passed to **`--attn-weights`**) |
+| Pre-attention and post-attention block RMSNorm γ (per layer) | **`norms.bin`** (entries 0 and 1 for that layer) |
+| Head counts, dims, etc. | **`index.json`** (`model_config`, etc.) |
+
+**Not read for the attention forward** (no matmuls, no logits from these):
+
+- **`attn_meta.bin`**, **`attn_meta_scores.bin`**, and **`attention_metadata`** in `index.json` — produced by **`build_attn_semantic_meta.py`** for **Option C** semantic labels; used only by the Python script **`vindex_infer_ffn_att.py --attn-meta`** *after* inference to print a summary, not by Rust inference.
+- **A-Vindex sidecar** (`attn_index.json`, `attn_centroids.bin`, `attn_k_proj_weights.bin`) — only for **`--attn-vindex-probe`** / **`--attn-vindex-scan`** (diagnostics), not for the transformer forward.
+
 Examples (Unix-style paths; on Windows use `.\target\release\vindex-infer.exe` and `.\gemma3-4b.vindex`):
 
 ```bash

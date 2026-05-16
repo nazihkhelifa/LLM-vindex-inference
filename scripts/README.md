@@ -20,6 +20,8 @@ For the **attention** side of the Vindex, this repo does **not** replace LarQLâ€
 
 That is the Python path for **deriving extra attention-side metadata** from the **mmapâ€™d attention Vindex** files, without loading the original Hugging Face PyTorch model.
 
+**Inference (Rust or `vindex_infer_python.py`) never loads `attn_meta.bin` for the forward pass.** Attention matmuls use **`attn_weights.bin`** + **`norms.bin`** (and the rest of the vindex: embeddings, FFN blobs, `index.json`). `attn_meta.bin` is only consulted when you pass **`--attn-meta`** on `vindex_infer_ffn_att.py`, after logits are computed.
+
 ### Gemma 3 in practice
 
 The inference scripts are exercised against **Gemma 3**-class Vindexes that include **both** FFN and attention weights (e.g. the public snapshot below). Use **`--forward full`** (default) for attention + FFN; **`--forward ffn-only`** for an ablation without the attention sublayer.

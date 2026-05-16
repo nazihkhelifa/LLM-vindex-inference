@@ -1,9 +1,11 @@
 //! vindex-infer: Vendor-free LLM inference from decomposed weights.
 
 mod attn_avindex;
+mod causal_grounded;
 mod extract_attn_avindex;
 mod hf_model;
 mod inference;
+mod kernels;
 mod vindex;
 
 use std::collections::HashSet;
@@ -34,13 +36,15 @@ struct DownloadHfCli {
     hf_token: Option<String>,
 }
 
-#[derive(Copy, Clone, Default, Debug, ValueEnum)]
+#[derive(Copy, Clone, Default, Debug, PartialEq, ValueEnum)]
 enum ForwardMode {
     /// Full transformer (attention + FFN each layer).
     #[default]
     Full,
     /// Ablation: skip attention sub-layer; FFN still runs (not HF-equivalent).
     FfnOnly,
+    /// Dual pass: full reference vs grounded causal head pruning (see `causal_grounded`).
+    GroundedCausal,
 }
 
 #[derive(Parser)]
@@ -75,9 +79,21 @@ struct Args {
     #[arg(long)]
     gpu: Option<usize>,
 
-    /// `full` = standard Gemma path; `ffn-only` = skip attention each layer (diagnostic).
+    /// `full` = standard Gemma path; `ffn-only` = skip attention; `grounded-causal` = pruned heads + audit.
     #[arg(long, value_enum, default_value_t = ForwardMode::Full)]
     forward: ForwardMode,
+
+    /// Cumulative head-probability mass for `--forward grounded-causal` (default 0.88).
+    #[arg(long, default_value_t = 0.88)]
+    grounded_energy_threshold: f32,
+
+    /// Softmax temperature over head energies for grounded routing (default 4.5).
+    #[arg(long, default_value_t = 4.5)]
+    grounded_softmax_temp: f32,
+
+    /// Minimum active heads per layer after layer 0 for grounded routing (default 2).
+    #[arg(long, default_value_t = 2)]
+    grounded_min_k: usize,
 
     /// After inference, run A-Vindex centroid probe (requires `attn_index.json`,
     /// `attn_centroids.bin`, `attn_k_proj_weights.bin` from `avindex_attention.py` extract).
@@ -101,7 +117,8 @@ struct Args {
     attn_scan_layers: Option<String>,
 
     /// Greedy multi-step generation: repeatedly append top-1 next token until EOS / stop token or `--max-new-tokens`.
-    /// Requires `--prompt` and a tokenizer (same rules as text prompts). Incompatible with `--token-ids`.
+    /// Works with `--forward full`, `ffn-only`, or `grounded-causal`. Requires `--prompt` and a tokenizer.
+    /// Incompatible with `--token-ids`.
     #[arg(long, conflicts_with = "token_ids")]
     conversation: bool,
 
@@ -194,7 +211,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.conversation && args.prompt.is_none() {
         return Err("--conversation requires --prompt (and a tokenizer)".into());
     }
-
     println!("vindex-infer — Vendor-free LLM inference");
     println!();
 
@@ -273,8 +289,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Backend: {}", if args.gpu.is_some() { "Vulkan GPU" } else { "CPU (rayon)" });
     println!("Forward: {:?}", args.forward);
     if args.conversation {
+        let engine = match args.forward {
+            ForwardMode::Full => "full attention+FFN",
+            ForwardMode::FfnOnly => "ffn-only",
+            ForwardMode::GroundedCausal => "grounded-causal",
+        };
         println!(
-            "Mode: conversation (greedy top-1, max {} new tokens)",
+            "Mode: conversation ({engine}, greedy top-1, max {} new tokens)",
             args.max_new_tokens
         );
     }
@@ -288,21 +309,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         print!("  ");
         let _ = std::io::Write::flush(&mut std::io::stdout());
 
+        let grounded_cfg = causal_grounded::GroundedConfig {
+            min_pruning_k: args.grounded_min_k,
+            energy_threshold: args.grounded_energy_threshold,
+            softmax_temp: args.grounded_softmax_temp,
+        };
+
         let mut forward_ms = 0.0f64;
         let mut layer_ms = 0.0f64;
         let mut logits_ms = 0.0f64;
         let mut steps = 0usize;
 
         for _ in 0..args.max_new_tokens {
-            let result = match args.forward {
-                ForwardMode::Full => inference::infer(&vindex, &token_ids, 1),
-                ForwardMode::FfnOnly => inference::infer_ffn_only(&vindex, &token_ids, 1),
+            let (next_id, score) = match args.forward {
+                ForwardMode::Full => {
+                    let result = inference::infer(&vindex, &token_ids, 1);
+                    forward_ms += result.total_ms;
+                    layer_ms += result.layer_ms;
+                    logits_ms += result.logits_ms;
+                    result.top_k.first().copied().ok_or("empty top_k")?
+                }
+                ForwardMode::FfnOnly => {
+                    let result = inference::infer_ffn_only(&vindex, &token_ids, 1);
+                    forward_ms += result.total_ms;
+                    layer_ms += result.layer_ms;
+                    logits_ms += result.logits_ms;
+                    result.top_k.first().copied().ok_or("empty top_k")?
+                }
+                ForwardMode::GroundedCausal => {
+                    let result =
+                        causal_grounded::infer_grounded(&vindex, &token_ids, 1, grounded_cfg)?;
+                    forward_ms += result.total_ms;
+                    layer_ms += result.layer_ms;
+                    logits_ms += result.logits_ms;
+                    result.top_k.first().copied().ok_or("empty top_k")?
+                }
             };
-            forward_ms += result.total_ms;
-            layer_ms += result.layer_ms;
-            logits_ms += result.logits_ms;
-
-            let (next_id, score) = result.top_k.first().copied().ok_or("empty top_k")?;
             if stop_ids.contains(&next_id) {
                 println!();
                 println!(
@@ -340,14 +382,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "Conversation: {} new tokens | forward sum {:.1}ms (layers {:.0}ms, logits {:.0}ms)",
             steps, forward_ms, layer_ms, logits_ms
         );
+    } else if args.forward == ForwardMode::GroundedCausal {
+        let cfg = causal_grounded::GroundedConfig {
+            min_pruning_k: args.grounded_min_k,
+            energy_threshold: args.grounded_energy_threshold,
+            softmax_temp: args.grounded_softmax_temp,
+        };
+        let cmp = causal_grounded::compare(&vindex, &token_ids, args.top_k, cfg)?;
+        causal_grounded::print_alignment_report(&cmp);
+        let decode = |id: u32| format_decoded(tokenizer.as_ref(), id);
+        causal_grounded::print_comparison_table(&cmp, decode);
+        println!();
+        println!(
+            "Time: ref {:.1}ms | grounded {:.1}ms (layers {:.0}/{:.0} ms, logits {:.0}/{:.0} ms)",
+            cmp.reference.total_ms,
+            cmp.grounded.total_ms,
+            cmp.reference.layer_ms,
+            cmp.grounded.layer_ms,
+            cmp.reference.logits_ms,
+            cmp.grounded.logits_ms,
+        );
     } else {
         // Run inference (single forward)
         let result = match args.forward {
             ForwardMode::Full => inference::infer(&vindex, &token_ids, args.top_k),
             ForwardMode::FfnOnly => inference::infer_ffn_only(&vindex, &token_ids, args.top_k),
+            ForwardMode::GroundedCausal => unreachable!(),
         };
 
-        // Display results
         println!("Predictions:");
         for (i, (tid, score)) in result.top_k.iter().enumerate() {
             let piece = format_decoded(tokenizer.as_ref(), *tid);
