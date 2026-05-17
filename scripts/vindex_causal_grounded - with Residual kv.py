@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-vindex_causal_grounded.py
+vindex_causal_grounded_direct.py
 ================================================================================
-Implements Grounded Causal Markov Pruning with Calibrated Energy Scales.
-Fixes the winner-take-all softmax trap to restore structural stability and factual recall.
-Includes complete diagnostic energy map stream tracking for Oracle Stage 1.
+Implements Grounded Causal Markov Pruning with Unified Residual Stream Scoring.
+Integrates the KV-Direct formulation (arXiv:2603.19664) to predict layer L+1 
+attention energy states directly from a flat normalized residual cache.
+Fixes the context drift bug by dynamically updating the global residual cache line.
+Restores full diagnostic look-ahead energy tracking logs for deep visibility.
 """
 
 import sys
@@ -14,7 +16,7 @@ from pathlib import Path
 import numpy as np
 
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s: %(message)s", datefmt="%H:%M:%S", force=True)
-log = logging.getLogger("CausalGrounded")
+log = logging.getLogger("CausalDirect")
 
 WORKSPACE = Path(".")
 if str(WORKSPACE.resolve()) not in sys.path:
@@ -26,10 +28,8 @@ except ImportError:
     log.error("Please ensure vindex_infer_python.py is available in the local directory.")
     raise SystemExit(1)
 
-# "The currency of the UK is" → Pound (#2)
-#--token-ids "818,15130,529,506,6322,563"
 VINDEX_DIR = Path("./gemma3-4b.vindex")
-TEST_TOKENS = [2,818,15130,529,506,6322,563]  # <bos> The capital of France is
+TEST_TOKENS = [2, 818, 15130, 529, 506, 6322, 563]  # <bos> The currency of UK is
 TOKEN_LABELS = ["<bos>", "The", "currency", "of", " UK", "is"]
 
 MIN_PRUNING_K = 2
@@ -121,7 +121,6 @@ def run_reference_inference(vix):
             sorted_true_heads = np.argsort(layer_true_energies)[::-1]
             true_heads_per_layer[layer] = list(sorted_true_heads)
 
-            # --- DETAILED ORACLE MAP LOGGING ADDITION ---
             sorted_energies = layer_true_energies[sorted_true_heads]
             if layer == 0:
                 log.info(f"[L0] Reference Grounding Phase: All {nq}/{nq} heads systematically active.")
@@ -133,7 +132,6 @@ def run_reference_inference(vix):
                     for i, h in enumerate(sorted_true_heads)
                 )
                 log.info(f"[L{layer}] Reference Oracle Energy Map. Window: [{oracle_heads_str}]")
-            # ---------------------------------------------
 
             for tok in range(nt):
                 ho = np.zeros(nq * hd, dtype=np.float32)
@@ -169,6 +167,11 @@ def run_reference_inference(vix):
 
 
 def run_markov_inference(vix):
+    """
+    Optimized Grounded Markov Engine using fixed KV-Direct formulation.
+    Updates the history matrix at every layer block transition to match residual stream evolution.
+    Restores detailed per-head structural look-ahead logging capabilities.
+    """
     cfg = vix.config
     nl = cfg.num_layers
     nq, nkv, hd = vix.attn_dims()
@@ -179,6 +182,9 @@ def run_markov_inference(vix):
     residuals = [(vix.embedding_f32(int(tid)) * scale).astype(np.float32) for tid in TEST_TOKENS]
     nt = len(residuals)
     executed_heads_at_final_token = {}
+
+    # Unified Global Residual Storage Spine
+    normalized_residual_cache = [None] * nt
 
     for layer in range(nl):
         pfln = vix.norm_weights(layer, 2)
@@ -194,30 +200,25 @@ def run_markov_inference(vix):
             w_q, w_k, w_v, w_o = attn["w_q"], attn["w_k"], attn["w_v"], attn["w_o"]
             q_norm, k_norm = attn["q_norm"], attn["k_norm"]
 
+            # Step 1: Normalize current states for attention processing
             normed = [vip.rms_norm_1(residuals[tok], iln) for tok in range(nt)]
-            all_q, all_k, all_v = [], [], []
+            
+            # CRITICAL FIX: Update the look-ahead spine matrix with the active normalized vectors
+            for tok in range(nt):
+                normalized_residual_cache[tok] = normed[tok].copy()
 
+            all_q = []
             for tok in range(nt):
                 x_tok = normed[tok].astype(np.float32, copy=False)
                 q = (w_q @ x_tok).copy()
-                k = (w_k @ x_tok).copy()
-                vv = w_v @ x_tok
-
                 for hi in range(nq):
                     vip.rms_norm_qk(q[hi * hd : (hi + 1) * hd], q_norm)
-                for hi in range(nkv):
-                    vip.rms_norm_qk(k[hi * hd : (hi + 1) * hd], k_norm)
-
                 pos = tok / rf
                 for hi in range(nq):
                     vip.apply_rope_hf(q[hi * hd : (hi + 1) * hd], pos, rb, hd)
-                for hi in range(nkv):
-                    vip.apply_rope_hf(k[hi * hd : (hi + 1) * hd], pos, rb, hd)
-
                 all_q.append(q)
-                all_k.append(k)
-                all_v.append(vv)
 
+            # Step 2: Interleaved Attention Selection
             for tok in range(nt):
                 if layer == 0:
                     active_heads = list(range(nq))
@@ -231,10 +232,17 @@ def run_markov_inference(vix):
                     for hj in range(nq):
                         kv_hj = hj // groups
                         qs, ks = hj * hd, kv_hj * hd
-
+                        w_k_head = w_k[ks : ks + hd, :]
+                        
                         seq_scores = np.empty(tok + 1, dtype=np.float32)
                         for j in range(tok + 1):
-                            seq_scores[j] = float(np.sum(qrow[qs : qs + hd] * all_k[j][ks : ks + hd])) * attn_scale
+                            # Reconstruct K dynamically from the current layer-accurate residual cache line
+                            h_j = normalized_residual_cache[j]
+                            k_reconstructed = w_k_head @ h_j
+                            vip.rms_norm_qk(k_reconstructed, k_norm)
+                            vip.apply_rope_hf(k_reconstructed, j / rf, rb, hd)
+                            
+                            seq_scores[j] = float(np.sum(qrow[qs : qs + hd] * k_reconstructed)) * attn_scale
 
                         if len(seq_scores) > 1:
                             upcoming_energies[hj] = float(np.max(seq_scores[1:]))
@@ -244,7 +252,6 @@ def run_markov_inference(vix):
                     sorted_next_heads = np.argsort(upcoming_energies)[::-1]
                     sorted_energies = upcoming_energies[sorted_next_heads]
 
-                    # Apply cross-head calibration scale factor
                     exp_energies = np.exp((sorted_energies - np.max(sorted_energies)) / SOFTMAX_TEMP)
                     probs = exp_energies / np.sum(exp_energies)
                     cum_probs = np.cumsum(probs)
@@ -257,9 +264,18 @@ def run_markov_inference(vix):
                     if layer == 0:
                         log.info(f"[L0] Grounding Phase: Bypassed pruning. Executed all {nq}/{nq} heads.")
                     else:
-                        top_heads_str = ", ".join(f"H{h}(P:{probs[i]*100:.1f}%)" for i, h in enumerate(active_heads))
-                        log.info(f"[L{layer}] Grounded Causal Loop (Preserved Norm). K={chosen_k}/{nq} (Cov:{cum_probs[chosen_k-1]*100:.1f}%). Window: [{top_heads_str}]")
+                        # RESTORED DIAGNOSTIC LOGGING: Emits the exact calibrated metric space for each head
+                        top_heads_str = ", ".join(
+                            f"H{h}(E:{upcoming_energies[h]:.2f}, P:{probs[i]*100:.1f}%)" 
+                            for i, h in enumerate(sorted_next_heads[:chosen_k])
+                        )
+                        log.info(
+                            f"[L{layer}] Grounded Direct Loop (KV Cache Free). "
+                            f"K={chosen_k}/{nq} (Cov:{cum_probs[chosen_k-1]*100:.1f}%). "
+                            f"Window: [{top_heads_str}]"
+                        )
 
+                # Step 3: Fast Sparse Value Synthesis
                 ho = np.zeros(nq * hd, dtype=np.float32)
                 for hi in range(nq):
                     if hi not in active_heads:
@@ -269,21 +285,33 @@ def run_markov_inference(vix):
                     qs, ks = hi * hd, kv_hi * hd
                     qrow = all_q[tok]
 
+                    w_k_head = w_k[ks : ks + hd, :]
+                    w_v_head = w_v[ks : ks + hd, :]
+
                     scores = np.empty(tok + 1, dtype=np.float32)
+                    reconstructed_v = []
+
                     for j in range(tok + 1):
-                        scores[j] = float(np.sum(qrow[qs : qs + hd] * all_k[j][ks : ks + hd])) * attn_scale
+                        h_j = normalized_residual_cache[j]
+                        
+                        k_rec = w_k_head @ h_j
+                        vip.rms_norm_qk(k_rec, k_norm)
+                        vip.apply_rope_hf(k_rec, j / rf, rb, hd)
+                        scores[j] = float(np.sum(qrow[qs : qs + hd] * k_rec)) * attn_scale
+                        
+                        v_rec = w_v_head @ h_j
+                        reconstructed_v.append(v_rec)
 
                     max_s = float(np.max(scores))
                     exp_s = np.exp(scores - max_s)
                     sum_e = max(float(np.sum(exp_s)), 1e-10)
 
                     for j in range(tok + 1):
-                        ho[qs : qs + hd] += (exp_s[j] / sum_e) * all_v[j][ks : ks + hd]
+                        ho[qs : qs + hd] += (exp_s[j] / sum_e) * reconstructed_v[j]
 
-                projected_delta = w_o @ ho
-                normed_delta = vip.rms_norm_1(projected_delta, paln)
-                residuals[tok] = residuals[tok] + normed_delta
+                residuals[tok] = residuals[tok] + vip.rms_norm_1(w_o @ ho, paln)
 
+        # Feed-forward block execution 
         for tok in range(nt):
             x_tok = vip.rms_norm_1(residuals[tok], pfln)
             gs = vix.gate_matvec(layer, x_tok)
@@ -299,9 +327,9 @@ def run_markov_inference(vix):
 
 def print_accuracy_report(true_profiles, executed_profiles, nl):
     print("\n" + "=" * 85)
-    print("               GROUNDED CAUSAL ATTENTION WINDOW ALIGNMENT AUDIT")
+    print("               GROUNDED DIRECT ATTENTION WINDOW ALIGNMENT AUDIT")
     print("=" * 85)
-    print(" Layer  | True Dominant Sequence (Top-3) | Final Token Causal Window    | Coverage")
+    print(" Layer  | True Dominant Sequence (Top-3) | Final Token Direct Window    | Coverage")
     print("-" * 85)
 
     total_true_captured = 0
@@ -327,7 +355,7 @@ def print_accuracy_report(true_profiles, executed_profiles, nl):
     accuracy = (total_true_captured / total_possible_slots) * 100
     print("-" * 85)
     print(f" TOTAL CRITICAL ROUTING HEADS CAPTURED: {total_true_captured} / {total_possible_slots} slots")
-    print(f" MARKOV ENGINE TARGET RETENTION ACCURACY: {accuracy:.2f}%")
+    print(f" DIRECT DIRECT INTEGRATION RETENTION ACCURACY: {accuracy:.2f}%")
     print("=" * 85)
 
 
@@ -337,7 +365,7 @@ def print_comparison_table(ref_results, markov_results, tokenizer=None):
     print("=" * 95)
     print(f" Prompt: {' '.join(TOKEN_LABELS)}")
     print("-" * 95)
-    print(" Rank |  [ENGINE A] REFERENCE (UNPRUNED)     |  [ENGINE B] GROUNDED MARKOV ENGINE")
+    print(" Rank |  [ENGINE A] REFERENCE (UNPRUNED)     |  [ENGINE B] GROUNDED KV-DIRECT ENGINE")
     print("      | Token ID  | Logit Score | Decoded String | Token ID  | Logit Score | Decoded String")
     print("-" * 95)
 
@@ -377,7 +405,7 @@ def main():
     print("\n--- STAGE 1: GATHERING ORACLE STREAM MAPS ---")
     ref_top_k, true_head_profiles = run_reference_inference(vix)
 
-    print("\n--- STAGE 2: EXECUTING TRUE LOCAL INTERLEAVED LOOK-AHEAD PASS ---")
+    print("\n--- STAGE 2: EXECUTING TRUE LOCAL INTERLEAVED DIRECT LOOK-AHEAD PASS ---")
     markov_top_k, executed_profiles = run_markov_inference(vix)
 
     print_accuracy_report(true_head_profiles, executed_profiles, vix.config.num_layers)
